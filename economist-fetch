@@ -1,0 +1,397 @@
+#!/usr/bin/env python3
+"""
+economist-fetch: Standard-library backend for Omarchy Magazine Covers HUD.
+Fetches the last 5 covers for The Economist, The New Yorker, Barron's, and Newsweek.
+Requires NO third-party packages (zero bs4/certifi dependencies).
+Caches high-resolution cover images locally and supports Discord alerts.
+"""
+from __future__ import annotations
+
+import argparse
+import datetime
+import hashlib
+import html as html_lib
+import json
+import os
+import re
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CACHE_DIR = os.path.expanduser("~/.local/state/omarchy/economist")
+COVERS_DIR = os.path.join(CACHE_DIR, "covers")
+CACHE_FILE = os.path.join(CACHE_DIR, "cache.json")
+CONFIG_FILE = os.path.join(CACHE_DIR, "config.json")
+
+USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
+
+# Create a robust SSL context that works on all Linux distributions
+try:
+    SSL_CTX = ssl.create_default_context()
+except Exception:
+    SSL_CTX = ssl._create_unverified_context()
+
+
+def load_config() -> dict:
+    if not os.path.exists(CONFIG_FILE):
+        default_cfg = {
+            "discord_webhook": "https://discord.com/api/webhooks/1478047144975007847/_Gug8GjeUvvWdR-rz0qOjSoDAxHm79lqLqQ6fv4I5MDf6PkQOo3weBCCtmjTWdCC-jKg",
+            "active_source": "economist"
+        }
+        try:
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump(default_cfg, f, indent=2)
+            return default_cfg
+        except Exception:
+            return default_cfg
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def download_image(url: str, dest_path: str, force: bool = False) -> bool:
+    if not url:
+        return False
+    if not force and os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024:
+        return True
+    try:
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as resp:
+            content = resp.read()
+            if len(content) > 1024:
+                with open(dest_path, "wb") as f:
+                    f.write(content)
+                return True
+    except Exception as e:
+        sys.stderr.write(f"Image download error for {url}: {e}\n")
+    return False
+
+
+def get_economist_covers(force: bool = False) -> list[dict]:
+    url = "https://www.economist.com/printedition/rss.xml"
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    base_date = datetime.date(2026, 10, 31)
+    lead_title = ""
+    try:
+        with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as r:
+            xml_text = r.read().decode("utf-8", errors="replace")
+        m = re.search(r"weeklyedition/(\d{4})-(\d{2})-(\d{2})", xml_text)
+        if m:
+            base_date = datetime.date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        tm = re.search(r"<channel>.*?<title><!\[CDATA\[(.*?)\]\]>", xml_text, re.DOTALL)
+        if tm:
+            lead_title = tm.group(1).strip()
+    except Exception as e:
+        sys.stderr.write(f"Economist fetch notice: {e}\n")
+
+    covers = []
+    for i in range(5):
+        d = base_date - datetime.timedelta(days=7 * i)
+        ymd = d.strftime("%Y%m%d")
+        iso = d.strftime("%Y-%m-%d")
+        img_url = f"https://www.economist.com/cdn-cgi/image/width=1200,quality=85,format=auto/content-assets/images/{ymd}_DE_US.jpg"
+        local_path = os.path.join(COVERS_DIR, f"economist_{ymd}.jpg")
+        has_local = download_image(img_url, local_path, force=force)
+
+        covers.append({
+            "id": f"economist_{ymd}",
+            "title": lead_title if i == 0 and lead_title else f"Issue of {d.strftime('%B %d, %Y')}",
+            "date": iso,
+            "formatted_date": d.strftime("%B %d, %Y"),
+            "label": d.strftime("%b %d"),
+            "image_url": img_url,
+            "local_image": local_path if has_local else img_url,
+            "source_url": f"https://www.economist.com/weeklyedition/{iso}"
+        })
+    return covers
+
+
+def get_barrons_covers(force: bool = False) -> list[dict]:
+    covers = []
+    try:
+        req = urllib.request.Request("https://www.barrons.com/magazine/archives", headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as r:
+            html = r.read().decode("utf-8", errors="replace")
+
+        m = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.DOTALL)
+        if m:
+            payload = json.loads(m.group(1))
+            archive = payload.get("props", {}).get("pageProps", {}).get("archiveData", [])
+            for i, a in enumerate(archive[:5]):
+                raw_d = a.get("printPublicationDate") or a.get("timestamp") or ""
+                d_str = raw_d[:10] if raw_d else "Recent"
+                try:
+                    dt = datetime.date.fromisoformat(d_str)
+                    fmt_d = dt.strftime("%B %d, %Y")
+                    lbl = dt.strftime("%b %d")
+                    ymd = dt.strftime("%Y%m%d")
+                except Exception:
+                    fmt_d = d_str
+                    lbl = d_str
+                    ymd = f"item_{i}"
+
+                cover_info = a.get("altSummaries", {}).get("Cover Image", {})
+                img_url = cover_info.get("image") or a.get("imageData", {}).get("imgUrl") or ""
+
+                local_path = os.path.join(COVERS_DIR, f"barrons_{ymd}.jpg")
+                has_local = download_image(img_url, local_path, force=force)
+
+                headline = cover_info.get("headline") or a.get("headline") or "Barron's Magazine"
+                headline = html_lib.unescape(headline.strip())
+
+                covers.append({
+                    "id": f"barrons_{ymd}",
+                    "title": headline,
+                    "date": d_str,
+                    "formatted_date": fmt_d,
+                    "label": lbl,
+                    "image_url": img_url,
+                    "local_image": local_path if has_local else img_url,
+                    "source_url": "https://www.barrons.com" + (a.get("archiveUrl") or "")
+                })
+    except Exception as e:
+        sys.stderr.write(f"Barron's fetch notice: {e}\n")
+    return covers
+
+
+def get_newyorker_covers(force: bool = False) -> list[dict]:
+    covers = []
+    try:
+        req = urllib.request.Request("https://www.newyorker.com/tag/covers", headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as r:
+            html = r.read().decode("utf-8", errors="replace")
+
+        matches = re.findall(r'<a[^>]+href="([^">]*cover-story[^">]*)"[^>]*>.*?<img[^>]+alt="([^"]*)"[^>]*src="([^">]+)"', html, re.DOTALL)
+        if not matches:
+            pairs = re.findall(r'<a[^>]+href="([^">]*cover-story[^">]*)"[^>]*>.*?<img[^>]+src="([^">]+)"', html, re.DOTALL)
+            matches = [(p[0], "", p[1]) for p in pairs]
+
+        seen = set()
+        for url_path, alt_title, img_url in matches:
+            if img_url in seen:
+                continue
+            seen.add(img_url)
+
+            slug = url_path.strip("/").split("/")[-1].replace("cover-story-", "")
+            m_date = re.search(r"(\d{4})-(\d{2})-(\d{2})", slug)
+            if m_date:
+                dt = datetime.date(int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)))
+                fmt_d = dt.strftime("%B %d, %Y")
+                lbl = dt.strftime("%b %d")
+                d_str = dt.isoformat()
+            else:
+                fmt_d = f"Issue of {slug}"
+                lbl = slug[-5:] if len(slug) >= 5 else f"#{len(covers)+1}"
+                d_str = slug
+
+            title = html_lib.unescape(alt_title.strip()) if alt_title.strip() else f"The New Yorker · {fmt_d}"
+
+            h = hashlib.md5(img_url.encode()).hexdigest()[:8]
+            local_path = os.path.join(COVERS_DIR, f"newyorker_{h}.jpg")
+            has_local = download_image(img_url, local_path, force=force)
+
+            covers.append({
+                "id": f"newyorker_{h}",
+                "title": title,
+                "date": d_str,
+                "formatted_date": fmt_d,
+                "label": lbl,
+                "image_url": img_url,
+                "local_image": local_path if has_local else img_url,
+                "source_url": ("https://www.newyorker.com" + url_path) if url_path.startswith("/") else url_path
+            })
+            if len(covers) >= 5:
+                break
+    except Exception as e:
+        sys.stderr.write(f"New Yorker fetch notice: {e}\n")
+    return covers
+
+
+def get_newsweek_covers(force: bool = False) -> list[dict]:
+    covers = []
+    try:
+        req = urllib.request.Request("https://www.newsweek.com/archive", headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=8, context=SSL_CTX) as r:
+            html = r.read().decode("utf-8", errors="replace")
+
+        # Find all cover images using pure regex
+        seen = set()
+        img_matches = re.findall(r'<img[^>]+src="([^">]*Cover-[^">]+)"', html)
+        for src in img_matches:
+            src = html_lib.unescape(src)
+            if src in seen:
+                continue
+            seen.add(src)
+
+            m = re.search(r"-(\d{2})(\d{2})(\d{2})-Cover", src)
+            if m:
+                yy, mm, dd = m.groups()
+                d_str = f"20{yy}-{mm}-{dd}"
+                try:
+                    dt = datetime.date.fromisoformat(d_str)
+                    fmt_d = dt.strftime("%B %d, %Y")
+                    lbl = dt.strftime("%b %d")
+                    ymd = dt.strftime("%Y%m%d")
+                except Exception:
+                    fmt_d = d_str
+                    lbl = d_str
+                    ymd = f"{yy}{mm}{dd}"
+            else:
+                d_str = "Recent"
+                fmt_d = "Recent Issue"
+                lbl = "Recent"
+                ymd = hashlib.md5(src.encode()).hexdigest()[:8]
+
+            local_path = os.path.join(COVERS_DIR, f"newsweek_{ymd}.jpg")
+            has_local = download_image(src, local_path, force=force)
+
+            covers.append({
+                "id": f"newsweek_{ymd}",
+                "title": f"Newsweek Magazine · {fmt_d}",
+                "date": d_str,
+                "formatted_date": fmt_d,
+                "label": lbl,
+                "image_url": src,
+                "local_image": local_path if has_local else src,
+                "source_url": "https://www.newsweek.com/archive"
+            })
+            if len(covers) >= 5:
+                break
+    except Exception as e:
+        sys.stderr.write(f"Newsweek fetch notice: {e}\n")
+    return covers
+
+
+def fetch_all_sources(force: bool = False) -> dict:
+    os.makedirs(COVERS_DIR, exist_ok=True)
+    cfg = load_config()
+
+    if not force and os.path.exists(CACHE_FILE):
+        try:
+            mtime = os.path.getmtime(CACHE_FILE)
+            age = (datetime.datetime.now().timestamp() - mtime)
+            if age < 10800:
+                with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                    cached = json.load(f)
+                if cached.get("sources", {}).get("economist", {}).get("covers"):
+                    return cached
+        except Exception:
+            pass
+
+    economist_covers = get_economist_covers(force=force)
+    barrons_covers = get_barrons_covers(force=force)
+    newyorker_covers = get_newyorker_covers(force=force)
+    newsweek_covers = get_newsweek_covers(force=force)
+
+    result = {
+        "active_source": cfg.get("active_source", "economist"),
+        "discord_configured": bool(cfg.get("discord_webhook")),
+        "sources": {
+            "economist": {
+                "id": "economist",
+                "name": "The Economist",
+                "color": "#E51C1C",
+                "covers": economist_covers
+            },
+            "newyorker": {
+                "id": "newyorker",
+                "name": "The New Yorker",
+                "color": "#000000",
+                "covers": newyorker_covers
+            },
+            "barrons": {
+                "id": "barrons",
+                "name": "Barron's",
+                "color": "#0F4C81",
+                "covers": barrons_covers
+            },
+            "newsweek": {
+                "id": "newsweek",
+                "name": "Newsweek",
+                "color": "#E10600",
+                "covers": newsweek_covers
+            }
+        },
+        "updated_at": datetime.datetime.now().isoformat()
+    }
+
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(result, f, indent=2)
+    except Exception:
+        pass
+
+    return result
+
+
+def send_discord_cover(source_id: str = "economist", index: int = 0) -> bool:
+    cfg = load_config()
+    webhook_url = cfg.get("discord_webhook")
+    if not webhook_url:
+        sys.stderr.write("No Discord webhook configured.\n")
+        return False
+
+    data = fetch_all_sources(force=False)
+    src_obj = data.get("sources", {}).get(source_id, {})
+    covers = src_obj.get("covers", [])
+    if not covers or index >= len(covers):
+        return False
+
+    c = covers[index]
+    mag_name = src_obj.get("name", "Magazine")
+    color_hex = src_obj.get("color", "#E51C1C").lstrip("#")
+    try:
+        color_int = int(color_hex, 16)
+    except Exception:
+        color_int = 15015708
+
+    embed = {
+        "title": f"{mag_name} — {c.get('formatted_date', '')}",
+        "description": f"**Cover:** {c.get('title', '')}",
+        "url": c.get("source_url", ""),
+        "color": color_int,
+        "image": {"url": c.get("image_url", "")},
+        "footer": {"text": f"Omarchy · {mag_name} Cover Viewer"}
+    }
+
+    payload = {
+        "content": f"📰 **{mag_name}** cover dropped!",
+        "embeds": [embed]
+    }
+
+    try:
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "User-Agent": USER_AGENT}
+        )
+        with urllib.request.urlopen(req, timeout=10, context=SSL_CTX) as resp:
+            return resp.status in (200, 204)
+    except Exception as e:
+        sys.stderr.write(f"Discord error: {e}\n")
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Multi-Magazine Cover Viewer Backend")
+    parser.add_argument("command", choices=["json", "refresh", "discord"], default="json", nargs="?")
+    parser.add_argument("--source", default="economist", help="Magazine source key")
+    parser.add_argument("--index", type=int, default=0, help="Cover index (0-4)")
+    args = parser.parse_args()
+
+    if args.command in ("json", "refresh"):
+        res = fetch_all_sources(force=(args.command == "refresh"))
+        print(json.dumps(res, indent=2))
+    elif args.command == "discord":
+        ok = send_discord_cover(source_id=args.source, index=args.index)
+        print(json.dumps({"success": ok}))
+
+
+if __name__ == "__main__":
+    main()
